@@ -4,6 +4,10 @@ import sys
 import io
 import threading
 from datetime import datetime
+
+# Add the extraction directory to sys.path
+sys.path.append(r"c:\Users\ELCOT\Documents\Thinkster_question_extraction")
+
 from ollama import Client
 from PIL import Image
 from flask import Flask, render_template, jsonify, request, Response, send_file
@@ -63,7 +67,7 @@ def save_ws_answers(ws_id):
         
         # Read the topic name from topic.txt if it exists
         topic_name = "Unknown Topic"
-        screenshots_dir = r"D:\automation thinkster\screenshots"
+        screenshots_dir = r"c:\Users\ELCOT\Documents\Thinkster_question_extraction\screenshots"
         topic_path = os.path.join(screenshots_dir, ws_id, "topic.txt")
         if os.path.exists(topic_path):
             try:
@@ -173,8 +177,252 @@ CRITICAL MATH RENDERING INSTRUCTIONS:
 CRITICAL OUTPUT FORMAT RULES FOR DATABASE STORAGE:
 At the very end of your response, on a new line, you must output exactly one of the following tags:
 - If there is an issue with the question: [RESULT: Issue]
-- If there is no issue: [RESULT: <correct_answer>] (where <correct_answer> is the short correct answer, option, or sequence, e.g., [RESULT: $150$] or [RESULT: Option A] or [RESULT: True, True, False, False])
+- If there is no issue, output: [RESULT: <correct_answer>]
+  Format <correct_answer> strictly based on the following question type:
+  1. Multiple Choice Questions (MCQ): Output ONLY the uppercase letter option (e.g., [RESULT: A], [RESULT: C]). Do NOT include any prefixes like "Option " or punctuation.
+  2. True/False Matrix Tables: Output as a JSON list of strings (e.g., [RESULT: ["True", "False", "True", "False"]]). Use standard capitalization.
+  3. Basic Numerical & Text Inputs: Output the exact number or text as a string value (e.g., [RESULT: 90], [RESULT: hello]). Do NOT wrap basic numerical/text inputs in LaTeX delimiters like $.
+  4. Advanced Mathematical Expressions (MathQuill / LaTeX): Output in standard LaTeX format (e.g., [RESULT: \frac{3}{4}], [RESULT: x^2], [RESULT: \sqrt{5}], [RESULT: (x+2)(x-3)]). Do NOT wrap the correct answer inside $ or $$ delimiters within the [RESULT: ...] tag.
 """
+
+# Global state dictionary for answering tracking metrics
+answering_state = {
+    "status": "Waiting", # Waiting, Processing, Completed, Failed
+    "worksheet_id": "",
+    "topic_name": "",
+    "logs": []
+}
+
+def run_pipeline_in_background(topic_name, worksheet_id, skip_extraction):
+    global analysis_state
+    stop_event.clear()
+    
+    start_dt = datetime.now()
+    with state_lock:
+        analysis_state["status"] = "Processing"
+        analysis_state["start_time"] = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+        analysis_state["end_time"] = None
+        analysis_state["total_worksheets"] = 1
+        analysis_state["completed_worksheets"] = 0
+        analysis_state["remaining_worksheets"] = 1
+        analysis_state["total_questions"] = 0
+        analysis_state["completed_questions"] = 0
+        analysis_state["current_worksheet_id"] = worksheet_id
+        analysis_state["current_question_number"] = 0
+        analysis_state["percent_complete"] = 0.0
+        analysis_state["logs"] = []
+        analysis_state["report"] = {}
+        analysis_state["total_issues"] = 0
+        analysis_state["total_passed"] = 0
+        analysis_state["execution_time_seconds"] = 0.0
+
+    def log_callback(msg, q_num=0):
+        with state_lock:
+            analysis_state["logs"].append({
+                "worksheet_id": worksheet_id,
+                "question_number": q_num,
+                "screenshot_name": f"Question_{q_num}.png" if q_num > 0 else "—",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "ai_response": msg
+            })
+
+    # Step 1: Screenshot Extraction
+    if not skip_extraction:
+        log_callback("Starting screenshot extraction phase (headless mode)...")
+        try:
+            from main import extract_screenshots_for_worksheet
+            success = extract_screenshots_for_worksheet(topic_name, worksheet_id, headless=True, log_callback=log_callback)
+            if not success:
+                log_callback("[ERROR] Screenshot extraction failed. Terminating pipeline.")
+                with state_lock:
+                    analysis_state["status"] = "Waiting"
+                return
+        except Exception as e:
+            log_callback(f"[ERROR] Exception during screenshot extraction: {e}")
+            with state_lock:
+                analysis_state["status"] = "Waiting"
+            return
+    else:
+        log_callback("Skipping screenshot extraction phase. Using existing images.")
+
+    # Write topic.txt so save_ws_answers can find it
+    screenshots_dir = r"c:\Users\ELCOT\Documents\Thinkster_question_extraction\screenshots"
+    ws_dir = os.path.join(screenshots_dir, worksheet_id)
+    if not os.path.exists(ws_dir):
+        log_callback(f"[ERROR] Screenshots directory for worksheet '{worksheet_id}' does not exist: {ws_dir}")
+        with state_lock:
+            analysis_state["status"] = "Waiting"
+        return
+
+    try:
+        with open(os.path.join(ws_dir, "topic.txt"), "w", encoding="utf-8") as f:
+            f.write(topic_name)
+    except Exception as e:
+        log_callback(f"[WARN] Failed to write topic.txt: {e}")
+
+    # Find screenshots
+    files = [f for f in os.listdir(ws_dir) if f.lower().startswith("question_") and f.lower().endswith(".png")]
+    files.sort(key=get_question_number)
+    
+    total_q = len(files)
+    with state_lock:
+        analysis_state["total_questions"] = total_q
+        
+    if total_q == 0:
+        log_callback("[ERROR] No screenshots found in the directory. Terminating.")
+        with state_lock:
+            analysis_state["status"] = "Waiting"
+        return
+
+    # Step 2: AI Analysis
+    log_callback("Starting AI review and answer generation phase...")
+    
+    # Ollama Client setup
+    os.environ["OLLAMA_API_KEY"] = "0c7664520257478d8880f66f99acd01c.eVrSvThIorHwwmOebPj5ZKGZ"
+    MODEL_NAME = "qwen3.5:397b"
+    
+    client = Client(
+        host="https://ollama.com",
+        headers={'Authorization': f"Bearer {os.getenv('OLLAMA_API_KEY')}"}
+    )
+    
+    completed_q_count = 0
+    with state_lock:
+        analysis_state["report"][worksheet_id] = {}
+
+    for filename in files:
+        if stop_event.is_set():
+            with state_lock:
+                analysis_state["status"] = "Stopped"
+                analysis_state["end_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                analysis_state["execution_time_seconds"] = (datetime.now() - start_dt).total_seconds()
+            return
+            
+        q_num = get_question_number(filename)
+        with state_lock:
+            analysis_state["current_question_number"] = q_num
+            
+        img_path = os.path.join(ws_dir, filename)
+        
+        max_retries = 3
+        retry_delay = 15
+        response = None
+        ai_text = ""
+
+        for attempt in range(max_retries):
+            try:
+                response = client.chat(
+                    model=MODEL_NAME,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": prompt,
+                            "images": [img_path]
+                        }
+                    ]
+                )
+                if response and "message" in response and "content" in response["message"]:
+                    ai_text = response["message"]["content"]
+                break
+            except Exception as e:
+                err_msg = str(e)
+                is_rate_limit = "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower()
+                
+                if is_rate_limit and attempt < max_retries - 1:
+                    log_callback(f"⏳ Rate limit reached. Waiting {retry_delay}s before retry...", q_num)
+                    time.sleep(retry_delay)
+                    continue
+                
+                if is_rate_limit:
+                    ai_text = f"❌ Rate limit exceeded after {max_retries} retries."
+                else:
+                    first_err_line = err_msg.split('\n')[0][:180]
+                    ai_text = f"❌ Model error: {first_err_line}"
+                break
+
+        is_issue = "Issue:" in ai_text or ai_text.startswith("❌")
+        analysis_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Save to database
+        if not ai_text.startswith("❌"):
+            doc = {
+                "worksheet_id": worksheet_id,
+                "question_number": q_num,
+                "image_name": filename,
+                "ai_response": ai_text,
+                "analysis_time": analysis_time_str,
+                "status": "Issue" if "Issue:" in ai_text else "Passed",
+                "created_timestamp": datetime.now()
+            }
+            try:
+                collection.insert_one(doc)
+            except Exception as e:
+                print(f"Failed to write to MongoDB: {e}")
+        
+        with state_lock:
+            if is_issue:
+                analysis_state["total_issues"] += 1
+            else:
+                analysis_state["total_passed"] += 1
+            
+            analysis_state["report"][worksheet_id][f"Q{q_num}"] = ai_text
+            completed_q_count += 1
+            analysis_state["completed_questions"] = completed_q_count
+            analysis_state["percent_complete"] = (completed_q_count / total_q) * 100.0
+            
+            analysis_state["logs"].append({
+                "worksheet_id": worksheet_id,
+                "question_number": q_num,
+                "screenshot_name": filename,
+                "timestamp": analysis_time_str,
+                "ai_response": ai_text
+            })
+
+    with state_lock:
+        analysis_state["completed_worksheets"] = 1
+        analysis_state["remaining_worksheets"] = 0
+        
+    save_ws_answers(worksheet_id)
+
+    end_dt = datetime.now()
+    execution_time = (end_dt - start_dt).total_seconds()
+    
+    with state_lock:
+        analysis_state["status"] = "Completed"
+        analysis_state["end_time"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+        analysis_state["execution_time_seconds"] = execution_time
+
+
+def run_answering_in_background(topic_name, ws_id, headless):
+    global answering_state
+    
+    with state_lock:
+        answering_state["status"] = "Processing"
+        answering_state["worksheet_id"] = ws_id
+        answering_state["topic_name"] = topic_name
+        answering_state["logs"] = []
+        
+    def log_callback(msg):
+        with state_lock:
+            answering_state["logs"].append({
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "message": msg
+            })
+            
+    try:
+        from main_answering import run_answering_for_worksheet
+        success = run_answering_for_worksheet(topic_name, ws_id, headless=headless, log_callback=log_callback)
+        
+        with state_lock:
+            if success:
+                answering_state["status"] = "Completed"
+            else:
+                answering_state["status"] = "Failed"
+    except Exception as e:
+        log_callback(f"[ERROR] Exception occurred during answering execution: {e}")
+        with state_lock:
+            answering_state["status"] = "Failed"
+
 
 def run_analysis_in_background():
     global analysis_state
@@ -196,7 +444,7 @@ def run_analysis_in_background():
         analysis_state["total_passed"] = 0
         analysis_state["execution_time_seconds"] = 0.0
 
-    screenshots_dir = r"D:\automation thinkster\screenshots"
+    screenshots_dir = r"c:\Users\ELCOT\Documents\Thinkster_question_extraction\screenshots"
     if not os.path.exists(screenshots_dir):
         with state_lock:
             analysis_state["status"] = "Waiting"
@@ -450,6 +698,19 @@ def reports():
 def worksheet_details(worksheet_id):
     return render_template("worksheet_details.html", worksheet_id=worksheet_id)
 
+@app.route("/check/<worksheet_id>")
+def check_worksheet(worksheet_id):
+    return render_template("check.html", worksheet_id=worksheet_id)
+
+@app.route("/screenshots/<worksheet_id>/<filename>")
+def serve_screenshot(worksheet_id, filename):
+    screenshots_dir = r"c:\Users\ELCOT\Documents\Thinkster_question_extraction\screenshots"
+    file_path = os.path.join(screenshots_dir, worksheet_id, filename)
+    if os.path.exists(file_path):
+        return send_file(file_path)
+    else:
+        return "Not Found", 404
+
 # API Routes
 @app.route("/api/start", methods=["POST"])
 def start_analysis():
@@ -457,13 +718,87 @@ def start_analysis():
     
     with state_lock:
         if analysis_state["status"] == "Processing":
-            return jsonify({"status": "error", "message": "Analysis is already running."}), 400
+            return jsonify({"status": "error", "message": "Analysis/Extraction is already running."}), 400
             
-    thread = threading.Thread(target=run_analysis_in_background)
+    data = request.get_json() or {}
+    topic_name = data.get("topic_name", "").strip()
+    worksheet_id = data.get("worksheet_id", "").strip()
+    skip_extraction = data.get("skip_extraction", False)
+    
+    if topic_name and worksheet_id:
+        # Start unified pipeline: Extraction + Analysis
+        thread = threading.Thread(target=run_pipeline_in_background, args=(topic_name, worksheet_id, skip_extraction))
+    else:
+        # Fallback to original analysis workflow of scanned worksheets
+        thread = threading.Thread(target=run_analysis_in_background)
+        
     thread.daemon = True
     thread.start()
     
     return jsonify({"status": "started"})
+
+@app.route("/api/db/answers/<worksheet_id>", methods=["GET"])
+def get_db_answers(worksheet_id):
+    try:
+        ws_answers_coll = db["WS_answers"]
+        doc = ws_answers_coll.find_one({"worksheetID": worksheet_id})
+        if not doc:
+            return jsonify({"error": f"No answers found for worksheet {worksheet_id}."}), 404
+        doc["_id"] = str(doc["_id"])
+        return jsonify(doc)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/save_answers/<worksheet_id>", methods=["POST"])
+def save_db_answers(worksheet_id):
+    try:
+        data = request.get_json()
+        ws_answers_coll = db["WS_answers"]
+        update_fields = {}
+        for k, v in data.items():
+            if k.startswith("q") or k == "topicName":
+                update_fields[k] = v
+        
+        ws_answers_coll.update_one(
+            {"worksheetID": worksheet_id},
+            {"$set": update_fields},
+            upsert=True
+        )
+        return jsonify({"status": "saved"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/run_answering", methods=["POST"])
+def start_answering():
+    global answering_state
+    try:
+        data = request.get_json() or {}
+        ws_id = data.get("worksheet_id")
+        topic_name = data.get("topic_name")
+        headless = data.get("headless", False)
+        
+        if not ws_id or not topic_name:
+            return jsonify({"error": "Missing worksheet_id or topic_name."}), 400
+            
+        with state_lock:
+            if answering_state["status"] == "Processing":
+                return jsonify({"error": "Answering automation is already running."}), 400
+                
+        thread = threading.Thread(target=run_answering_in_background, args=(topic_name, ws_id, headless))
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({"status": "started"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/answering/status", methods=["GET"])
+def get_answering_status():
+    global answering_state
+    with state_lock:
+        state_copy = dict(answering_state)
+    return jsonify(state_copy)
+
 
 @app.route("/api/reset", methods=["POST"])
 def reset_dashboard():

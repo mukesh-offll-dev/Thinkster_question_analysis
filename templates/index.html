@@ -701,6 +701,46 @@
 
     <div class="main-container">
         <div class="dashboard-content">
+            <!-- Run Configuration Card -->
+            <div class="glass-card" style="padding: 24px; display: flex; flex-direction: column; gap: 18px;">
+                <h3 style="font-size: 13px; font-weight: 700; color: var(--primary); text-transform: uppercase; letter-spacing: 0.8px; border-bottom: 2px solid var(--border); padding-bottom: 8px; margin-bottom: 5px;">
+                    Pipeline Configuration
+                </h3>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                    <div style="display: flex; flex-direction: column; gap: 6px;">
+                        <label for="pipelineTopic" style="font-size: 11px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px;">Topic Name</label>
+                        <select id="pipelineTopic" onchange="toggleManualTopic()" style="font-family: inherit; font-size: 13px; padding: 9px 12px; border-radius: 8px; border: 1.5px solid var(--border); background: var(--surface); color: var(--text-dark); outline: none; transition: border-color 0.2s;">
+                            <option value="Complex Numbers">Complex Numbers</option>
+                            <option value="Algebra 2 Foundations">Algebra 2 Foundations</option>
+                            <option value="Number Representation">Number Representation</option>
+                            <option value="Number Relation">Number Relation</option>
+                            <option value="Algebra">Algebra</option>
+                            <option value="Functions & Function Notation">Functions & Function Notation</option>
+                            <option value="Multiplication">Multiplication</option>
+                            <option value="Division">Division</option>
+                            <option value="Geometry">Geometry</option>
+                            <option value="__manual__">Manual entering...</option>
+                        </select>
+                        <input id="pipelineTopicManual" placeholder="Enter custom topic name..." style="display: none; font-family: inherit; font-size: 13px; padding: 9px 12px; border-radius: 8px; border: 1.5px solid var(--border); outline: none; margin-top: 8px; width: 100%;" />
+                    </div>
+                    <div style="display: flex; flex-direction: column; gap: 6px;">
+                        <label for="pipelineWorksheetId" style="font-size: 11px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px;">Worksheet ID</label>
+                        <input id="pipelineWorksheetId" placeholder="e.g. AQCONAL202" style="font-family: inherit; font-size: 13px; padding: 9px 12px; border-radius: 8px; border: 1.5px solid var(--border); background: var(--surface); color: var(--text-dark); outline: none; transition: border-color 0.2s; width: 100%;" />
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-top: 5px;">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <input type="checkbox" id="skipExtraction" style="cursor: pointer; width: 15px; height: 15px;" />
+                        <label for="skipExtraction" style="font-size: 13px; color: var(--text-mid); cursor: pointer; user-select: none;">Skip screenshot extraction (use existing files)</label>
+                    </div>
+                    <div>
+                        <button id="verifyAnswersBtn" class="btn btn-secondary" onclick="goToCheckPage()" style="display: none; background: var(--success-light); color: var(--success); border: 1px solid rgba(16,185,129,0.3);">
+                            Verify & Answer Worksheet
+                        </button>
+                    </div>
+                </div>
+            </div>
+
             <!-- Progress Tracker Grid -->
             <div class="progress-grid">
                 <!-- Status Card -->
@@ -887,32 +927,77 @@
                 .catch(() => showToast('❌ Failed to reset.', '#7F1D1D'));
         }
 
+        function toggleManualTopic() {
+            const select = document.getElementById("pipelineTopic");
+            const manual = document.getElementById("pipelineTopicManual");
+            if (select.value === "__manual__") {
+                manual.style.display = "block";
+            } else {
+                manual.style.display = "none";
+            }
+        }
+
+        function goToCheckPage() {
+            const wsId = document.getElementById("pipelineWorksheetId").value.trim();
+            if (wsId) {
+                window.location.href = `/check/${encodeURIComponent(wsId)}`;
+            } else {
+                showToast("⚠️ Enter or select a worksheet ID first.", "#E65100");
+            }
+        }
+
         function startAnalysis() {
             const startBtn = document.getElementById("startBtn");
             const stopBtn  = document.getElementById("stopBtn");
+            
+            const wsId = document.getElementById("pipelineWorksheetId").value.trim();
+            let topicName = document.getElementById("pipelineTopic").value;
+            if (topicName === "__manual__") {
+                topicName = document.getElementById("pipelineTopicManual").value.trim();
+            }
+            const skipExtraction = document.getElementById("skipExtraction").checked;
+
+            if (!wsId) {
+                showToast("⚠️ Worksheet ID is required.", "#E65100");
+                return;
+            }
+            if (!topicName) {
+                showToast("⚠️ Topic Name is required.", "#E65100");
+                return;
+            }
+
             startBtn.disabled = true;
             document.getElementById("showReportBtn").disabled = true;
+            document.getElementById("verifyAnswersBtn").style.display = "none";
 
-            fetch("/api/start", { method: "POST" })
-                .then(res => res.json())
-                .then(data => {
-                    if (data.status === "started") {
-                        showToast("✅ Analysis started!", "#1565C0");
-                        lastLogCount = 0;
-                        document.getElementById("logContainer").innerHTML = "";
-                        document.getElementById("reportSection").style.display = "none";
-                        stopBtn.style.display  = "inline-flex";
-                        startBtn.style.display = "none";
-                        startPolling();
-                    } else {
-                        showToast("⚠️ " + data.message, "#E65100");
-                        startBtn.disabled = false;
-                    }
+            fetch("/api/start", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    topic_name: topicName,
+                    worksheet_id: wsId,
+                    skip_extraction: skipExtraction
                 })
-                .catch(() => {
-                    showToast("❌ Failed to connect to backend.", "#C62828");
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.status === "started") {
+                    showToast("✅ Pipeline started!", "#1565C0");
+                    lastLogCount = 0;
+                    document.getElementById("logContainer").innerHTML = "";
+                    document.getElementById("reportSection").style.display = "none";
+                    stopBtn.style.display  = "inline-flex";
+                    startBtn.style.display = "none";
+                    startPolling();
+                } else {
+                    showToast("⚠️ " + data.message, "#E65100");
                     startBtn.disabled = false;
-                });
+                }
+            })
+            .catch(() => {
+                showToast("❌ Failed to connect to backend.", "#C62828");
+                startBtn.disabled = false;
+            });
         }
 
         function stopAnalysis() {
@@ -947,8 +1032,9 @@
                         document.getElementById("startBtn").style.display = "inline-flex";
                         document.getElementById("startBtn").disabled = false;
                         if (state.status === "Completed") {
-                            showToast("✅ Analysis completed!", "#2E7D32");
+                            showToast("✅ Pipeline completed!", "#2E7D32");
                             document.getElementById("showReportBtn").disabled = false;
+                            document.getElementById("verifyAnswersBtn").style.display = "inline-flex";
                             renderReportTable(state);
                         } else {
                             showToast("⏹️ Analysis stopped.", "#E65100");
@@ -989,6 +1075,14 @@
             document.getElementById("sidebarQuestion").innerText = state.current_question_number || "-";
             document.getElementById("sidebarIssues").innerText = state.total_issues;
             document.getElementById("sidebarPassed").innerText = state.total_passed;
+
+            // Pre-populate input if it is currently executing or completed
+            if (state.current_worksheet_id && !document.getElementById("pipelineWorksheetId").value) {
+                document.getElementById("pipelineWorksheetId").value = state.current_worksheet_id;
+                if (state.status === "Completed") {
+                    document.getElementById("verifyAnswersBtn").style.display = "inline-flex";
+                }
+            }
 
             // Timer and execution details
             document.getElementById("sidebarStart").innerText = state.start_time || "-";
